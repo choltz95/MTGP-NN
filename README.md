@@ -8,6 +8,9 @@ GPytorch [3] is used for MTGP interpolation & Pytorch [4] is used for the neural
 Results to be included.
 
 [1] Joseph Futoma, Sanjay Hariharan, Katherine Heller, Learning to Detect Sepsis with a Multitask Gaussian Process RNN Classifier, ICML'17 - https://arxiv.org/abs/1706.04152
+
 [2] Zhao Chen, Vijay Badrinarayanan, Chen-Yu Lee, Andrew Rabinovich, GradNorm: Gradient Normalization for Adaptive Loss Balancing in Deep Multitask Networks, ICML 2018 - https://arxiv.org/abs/1711.02257
+
 [3] https://gpytorch.ai/
+
 [4] https://arxiv.org/abs/1711.02257

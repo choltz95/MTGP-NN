@@ -1,7 +1,7 @@
 # MTGP-NN
 Early sepsis detection via multitask gaussian process cnn-rnn 
 
-We follow the general framework of [1] with several extensions. A Multitask Gaussian Process [2] is employed to normalize the time-scale of irregularly sampled clinical data (vital signs). Any prediction algorithm can be employed on top of this framework, but we process this data with a cnn-based encoder and perform temporal classification with a GRU-LSTM augmented with auxilliary features (patient demographics & coursened lab data statistics). Multitask learning is induced via prediction of hospital stay duration, etc. An implementation of gradnorm [3] is included to learn task-loss weights and the whole framework is optimized end-to-end with backprop.
+We follow the general framework of [1] with several extensions. A Multitask Gaussian Process [2] is applied to normalize the time-scale of irregularly sampled clinical data (vital signs). Any prediction algorithm can be employed on top of this framework, but we process this data with a cnn-based encoder and perform temporal classification with a GRU-LSTM augmented with auxilliary features (patient demographics & coursened lab data statistics). Multitask learning is induced via prediction of hospital stay duration, etc. An implementation of gradnorm [3] is included to learn task-loss weights and the whole framework is optimized end-to-end with backprop.
 
 GPytorch [3] is used for MTGP interpolation & Pytorch [4] is used for the neural network.
 

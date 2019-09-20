@@ -32,7 +32,7 @@ class Experiment:
         self.processing_params = processing_params
         self.model_params = model_params
         self.training_params = training_params
-        self.batch_size = 128
+        self.batch_size = 32
 
         self.global_nfp = None
         self.estimator = None
@@ -44,7 +44,7 @@ class Experiment:
         self.dataset = None
 
     @classmethod
-    def train(self, training_dict, processing_params=None, model_params=None, training_params=None):
+    def train(self, training_dict, validation_dict, processing_params=None, model_params=None, training_params=None):
 
         def batch(iterable, n=1):
             l = len(iterable)
@@ -52,26 +52,79 @@ class Experiment:
                 yield iterable[ndx:min(ndx + n, l)]
 
         model = self(processing_params, model_params, training_params)
+        model.model = model
         # Preprocess the data
         print('preprocessing')
-        for col in tqdm(training_dict['vital_features_list'][0].columns.tolist(), desc='fillna & normalize'):
-            for i, _ in enumerate(training_dict['pid_list']):
-                #training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].interpolate(method='linear', axis=0)
-                if training_dict['vital_features_list'][i][col].count() > 3:
-                    training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].interpolate(method='spline', order=3, axis=0)
-                training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].fillna(method='ffill').fillna(method='bfill')
-                training_dict['vital_features_list'][i][col] = np.log(1+training_dict['vital_features_list'][i][col])
+        for i, _ in enumerate(tqdm(training_dict['pid_list'], desc='pruning')):
+            if training_dict['vital_features_list'][i].shape[0] > 200:
+                for key in training_dict:
+                    if key == 'pid_list':
+                        continue
+                    training_dict[key][i] = training_dict[key][i].iloc[training_dict['vital_features_list'][i].shape[0] - 150:]
+
+        training_dict['input_list'] = []
+
+        full_train_not_nan_indexes = []
+        full_train_task_indexes = []
+        full_train_anchor_values = []
+
+        for i, _ in enumerate(tqdm(training_dict['pid_list'], desc='fillna & normalize')):
+            not_nan_indexes = []
+            task_indexes = []
+            anchor_values = []
+
+            for ii,col in enumerate(training_dict['vital_features_list'][0].columns.tolist()):
+                if col == "index":
+                    continue
+                iii = ii - 1
+                training_dict['vital_features_list'][i][col] = np.log(training_dict['vital_features_list'][i][col])
+                if training_dict['vital_features_list'][i][col].count() == 0:
+                    training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].fillna(0)
                 training_dict['vital_features_list'][i][col] = (training_dict['vital_features_list'][i][col] - training_dict['vital_features_list'][i][col].mean())/training_dict['vital_features_list'][i][col].std(ddof=0)
-                training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].fillna(0.0)
-        print()
+                training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].fillna(0)
+
+                #elif training_dict['vital_features_list'][i][col].count() == 1:
+                #    training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].fillna(training_dict['vital_features_list'][i][col].mean())
+                #elif training_dict['vital_features_list'][i][col].count() <= 3 :
+                #    training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].interpolate(method='linear').interpolate(method='nearest')
+
+                #if training_dict['vital_features_list'][i][col].count() > 3:
+                #    training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].interpolate(method='pchip', order=3, axis=0).interpolate(method='nearest')
+                #training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].fillna(method='ffill').fillna(method='bfill')
+                #training_dict['vital_features_list'][i][col] = training_dict['vital_features_list'][i][col].fillna(0.0)
+
+                not_nan = training_dict['vital_features_list'][i][col].notnull()
+                nn_ind = torch.FloatTensor(not_nan[not_nan == True].index.values)
+                nn_vals = torch.FloatTensor(training_dict['vital_features_list'][i][col][not_nan == True].values)
+                task_ind = torch.full_like(nn_vals, dtype=torch.long, fill_value=iii)
+
+                not_nan_indexes.append(nn_ind)
+                task_indexes.append(task_ind)
+                anchor_values.append(nn_vals)
+
+                full_train_not_nan_indexes.append(nn_ind)
+                full_train_task_indexes.append(task_ind)
+                full_train_anchor_values.append(nn_vals)
+
+            full_train_x = torch.cat(not_nan_indexes)
+            full_train_i = torch.cat(task_indexes)
+            full_train_y = torch.cat(anchor_values)
+
+            training_dict['input_list'].append([full_train_x, full_train_i, full_train_y])
 
         input_dim = training_dict['vital_features_list'][0].shape
         model.estimator = GPCNNLSTM(input_dim)
-        
+        #print('instantiating interpolation model with', len(full_train_not_nan_indexes),'data points')
+        init_data = move_to_cuda([full_train_not_nan_indexes[0],full_train_task_indexes[0], full_train_anchor_values[0]])
+        model.estimator.init_interpolation_model(init_data)
+        del init_data
+
         loss_iterations = []
         loss_history = []
+        tr_util = []
+        val_util = []
         # epochs
-        for k in tqdm(range(25), desc='epoch iterations'):
+        for k in tqdm(range(201), desc='epoch iterations'):
             loss_iteration_k = []
 
             # train on short sequences first
@@ -86,32 +139,26 @@ class Experiment:
                     training_dict[key] = [training_dict[key][i] for i in shuff_idx]
 
             # loop over training data
-            t = tqdm(range(int(model.batch_size % len(training_dict['pid_list'])) + 1), desc='batch iterations')
+            t = tqdm(range(int(len(training_dict['pid_list']) / model.batch_size) + 1), desc='batch iterations')
             for batch_idxs in batch(range(len(training_dict['pid_list'])), model.batch_size):
                 t.update(1)
-                #vital_features = torch.FloatTensor(training_dict['vital_features_list'][i].values)
-                #lab_features = torch.FloatTensor(training_dict['lab_features_list'][i].values)
-                #baseline_features = torch.FloatTensor(training_dict['baseline_features_list'][i].values)
-                #labels = torch.LongTensor(training_dict['labels_list'][i].values.T)
-                
-                #input_data = [vital_features.unsqueeze(0), lab_features, baseline_features]
 
-                #input_data_ = move_to_cuda(input_data)
-                #labels_ = labels.cuda()
+                #vital_features = [ torch.FloatTensor(training_dict['vital_features_list'][j].values) for j in batch_idxs ]
+                #lab_features = [ torch.FloatTensor(training_dict['lab_features_list'][j].values) for j in batch_idxs ]
+                #baseline_features = [ torch.FloatTensor(training_dict['baseline_features_list'][j].values) for j in batch_idxs ]
+                #labels = [ torch.from_numpy(np.array(training_dict['labels_list'][j])) for j in batch_idxs]
+                labels = [ torch.LongTensor(training_dict['labels_list'][j].values.T) for j in batch_idxs]
 
-                vital_features = [ torch.FloatTensor(training_dict['vital_features_list'][j].values) for j in batch_idxs ]
-                lab_features = [ torch.FloatTensor(training_dict['lab_features_list'][j].values) for j in batch_idxs ]
-                baseline_features = [ torch.FloatTensor(training_dict['baseline_features_list'][j].values) for j in batch_idxs ]
-                labels = [ torch.from_numpy(np.array(training_dict['labels_list'][j])) for j in batch_idxs]
-
-                input_data_ = [ [ torch.FloatTensor(training_dict['vital_features_list'][j].values).unsqueeze(0).cuda(), 
-                                  torch.FloatTensor(training_dict['lab_features_list'][j].values).unsqueeze(0).cuda(), 
-                                  torch.FloatTensor(training_dict['baseline_features_list'][j].values).unsqueeze(0).cuda()] for j in batch_idxs ]
+                #input_data_ = [ [ torch.FloatTensor(training_dict['vital_features_list'][j].values).unsqueeze(0).cuda(), 
+                #                  torch.FloatTensor(training_dict['lab_features_list'][j].values).unsqueeze(0).cuda(), 
+                #                  torch.FloatTensor(training_dict['baseline_features_list'][j].values).unsqueeze(0).cuda()] for j in batch_idxs ]
 
                 labels_ = move_to_cuda(labels)
-                vital_features_ = move_to_cuda(vital_features)
-                lab_features_ = move_to_cuda(lab_features)
-                baseline_features_ = move_to_cuda(baseline_features)
+                #vital_features_ = move_to_cuda(vital_features)
+                #lab_features_ = move_to_cuda(lab_features)
+                #baseline_features_ = move_to_cuda(baseline_features)
+
+                input_data_ = [move_to_cuda(training_dict['input_list'][j]) for j in batch_idxs]  # tuple of val ind, val, task ind
 
 
                 loss = model.estimator.update(input_data_, labels_)
@@ -130,9 +177,21 @@ class Experiment:
                 del labels_
             t.set_description(desc ='loss: {:.4f}'.format(np.mean(loss_iteration_k)), refresh=True)
             loss_iterations.append(np.mean(loss_iteration_k))
-        print()
-        plt.plot(loss_history)
-        plt.savefig('loss.png')
+            if k > 1 and k % 5 == 0:
+                tr_util.append(model.evaluate(training_dict,k, True, model))
+                val_util.append(model.evaluate(validation_dict,k, False, model))
+                tqdm.write('tr_util: ' + str(tr_util))
+                tqdm.write('val_util: ' + str(val_util))
+            if k > 10 and k % 25 == 0:
+                model.save(Path('./model_' + str(k) + '_.out'), model)
+                plt.plot(loss_history)
+                plt.savefig('loss.png')
+                plt.clf()
+
+                plt.plot(tr_util)
+                plt.plot(val_util)
+                plt.savefig('utility.png')
+                plt.clf()
         loss_iterations = pd.DataFrame(loss_iterations, columns = ["iteration"]) 
         return loss_iterations, model
 
@@ -152,29 +211,60 @@ class Experiment:
         return pr
 
     @classmethod
-    def save(self, model_path):
+    def save(self, model_path, model=None):
         # save torch model
-        torch.save(self.model.estimator.state_dict(), "./model.out")
+        if model:
+            torch.save(model.estimator.state_dict(), "./model.out")
+        else:
+            torch.save(self.model.estimator.state_dict(), "./model.out")
+        
     
     @classmethod
     def load(cls, processing_params, model_params, training_params, model_path):
         pass
     
     @classmethod
-    def evaluate(self, testing_dict):
+    def evaluate(self, testing_dict, j=0, tr=False, model=None):
         print('preprocessing')
         results = []
-        for col in tqdm(testing_dict['vital_features_list'][0].columns.tolist(), desc='fillna & normalize'):
-            for i, _ in enumerate(testing_dict['pid_list']):
-                #testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].interpolate(method='linear', axis=0)
-                if testing_dict['vital_features_list'][i][col].count() > 3:
-                    testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].interpolate(method='spline', order=3, axis=0)
-                testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].fillna(method='ffill').fillna(method='bfill')
+        testing_dict['input_list'] = []
+        for i, _ in enumerate(testing_dict['pid_list']):
+            not_nan_indexes = []
+            task_indexes = []
+            anchor_values = []
+            for ii,col in enumerate(testing_dict['vital_features_list'][0].columns.tolist()):
+                if col == "index":
+                    continue
+                iii = ii - 1
                 testing_dict['vital_features_list'][i][col] = np.log(testing_dict['vital_features_list'][i][col])
+                if testing_dict['vital_features_list'][i][col].count() == 0:
+                    testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].fillna(0)
                 testing_dict['vital_features_list'][i][col] = (testing_dict['vital_features_list'][i][col] - testing_dict['vital_features_list'][i][col].mean())/testing_dict['vital_features_list'][i][col].std(ddof=0)
-                testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].fillna(0.0)
-        print()
+                testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].fillna(0)
 
+                #elif testing_dict['vital_features_list'][i][col].count() == 1:
+                #    testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].fillna(testing_dict['vital_features_list'][i][col].mean())
+                #elif testing_dict['vital_features_list'][i][col].count() <= 3:
+                #    testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].interpolate(method='linear', axis=0).interpolate(method='nearest')
+                
+                #if testing_dict['vital_features_list'][i][col].count() > 3:
+                #    testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].interpolate(method='pchip', order=3, axis=0).interpolate(method='nearest')
+                #testing_dict['vital_features_list'][i][col] = testing_dict['vital_features_list'][i][col].fillna(0.0)
+
+                not_nan = testing_dict['vital_features_list'][i][col].notnull()
+                nn_ind = torch.FloatTensor(not_nan[not_nan == True].index.values)
+                nn_vals = torch.FloatTensor(testing_dict['vital_features_list'][i][col][not_nan == True].values)
+                task_ind = torch.full_like(nn_vals, dtype=torch.long, fill_value=iii)
+
+                not_nan_indexes.append(nn_ind)
+                task_indexes.append(task_ind)
+                anchor_values.append(nn_vals)
+
+            full_train_x = torch.cat(not_nan_indexes)
+            full_train_i = torch.cat(task_indexes)
+            full_train_y = torch.cat(anchor_values)
+
+            testing_dict['input_list'].append([full_train_x.cuda(), full_train_i.cuda(), full_train_y.cuda()])
 
         # Compute utility.
         dt_early   = -12
@@ -191,18 +281,22 @@ class Experiment:
         worst_utilities    = np.zeros(num_patients)
         inaction_utilities = np.zeros(num_patients)
 
-        for i, pid in enumerate(tqdm(testing_dict['pid_list'], desc='evaluate')):
-            vital_features = torch.FloatTensor(testing_dict['vital_features_list'][i].values)
-            lab_features = torch.FloatTensor(testing_dict['lab_features_list'][i].values)
-            baseline_features = torch.FloatTensor(testing_dict['baseline_features_list'][i].values)
+        for i, pid in enumerate(testing_dict['pid_list']):
+            #vital_features = torch.FloatTensor(testing_dict['vital_features_list'][i].values)
+            #lab_features = torch.FloatTensor(testing_dict['lab_features_list'][i].values)
+            #baseline_features = torch.FloatTensor(testing_dict['baseline_features_list'][i].values)
             labels = torch.LongTensor(testing_dict['labels_list'][i].values.T)
+            input_data_ = testing_dict['input_list'][i]
             
-            input_data = [vital_features.unsqueeze(0), lab_features, baseline_features]
+            #input_data = [vital_features.unsqueeze(0), lab_features, baseline_features]
 
-            input_data_ = move_to_cuda(input_data)
+            #input_data_ = move_to_cuda(input_data)
             labels_ = labels.cuda()
-
-            output = self.model.estimator.predict(input_data_)   
+            seq_length = labels.shape[1]
+            if model:
+                output = model.estimator.predict(input_data_, seq_length) 
+            else:
+                output = self.model.estimator.predict(input_data_, seq_length)   
             output = output.tolist()   
             predicted_label = self.postprocess(output) 
 
@@ -224,7 +318,6 @@ class Experiment:
             worst_utilities[i]    = compute_prediction_utility(labels, worst_predictions, dt_early, dt_optimal, dt_late, max_u_tp, min_u_fn, u_fp, u_tn)
             inaction_utilities[i] = compute_prediction_utility(labels, inaction_predictions, dt_early, dt_optimal, dt_late, max_u_tp, min_u_fn, u_fp, u_tn)
 
-
             results.append(pd.DataFrame(list(zip([pid]*len(output), [o[0] for o in output], [o[1] for o in output], predicted_label, labels)), columns = ["pid","p0", "p1", "prediction", "label"]))
 
         unnormalized_observed_utility = np.sum(observed_utilities)
@@ -233,14 +326,13 @@ class Experiment:
         unnormalized_inaction_utility = np.sum(inaction_utilities)
         normalized_observed_utility = (unnormalized_observed_utility - unnormalized_inaction_utility) / (unnormalized_best_utility - unnormalized_inaction_utility)
 
-        print()
-        print('utility', normalized_observed_utility)
-
-        eval_results = pd.concat(results)
-        eval_results.to_csv('./results.csv')
+        if tr == False:
+            eval_results = pd.concat(results)
+            eval_results.to_csv('./results_'+str(j)+'_.csv')
+        return normalized_observed_utility
 
     @classmethod
-    def exp(self, dataset_load_path='./dataset_balanced.gpickle'):
+    def exp(self, dataset_load_path='./dataset_balanced6.gpickle'):
         """
         trains model
         :param dataset_load_path: (optional) load path for training/test/validation data. if not specified, loads from experiment_path
@@ -248,7 +340,7 @@ class Experiment:
         """
         self.dataset = Dataset.load(dataset_load_path)
         
-        self.loss_iterations, self.model = self.train(self.dataset.groups['train'])
+        self.loss_iterations, self.model = self.train(self.dataset.groups['train'], self.dataset.groups['test'])
 
         self.model.evaluate(self.dataset.groups['test'])
         self.model.save(Path('./model.out'))

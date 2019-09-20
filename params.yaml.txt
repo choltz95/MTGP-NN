@@ -1,0 +1,10 @@
+model_params:
+  MLP_hidden:  32
+  MLP_layers:  2
+  MLP_activation:  'relu'
+  MLP_dropout:  0.1
+  optimizer_fcn:  "adam"
+  learning_rate:  0.0005
+  weight_decay:  0.0001
+  n_epoches:  100
+  batch_size:  32
